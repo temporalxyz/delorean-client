@@ -1373,6 +1373,7 @@ dependencies = [
  "solana-address 2.5.0",
  "solana-bls-signatures",
  "solana-bpf-loader-program",
+ "solana-compute-budget",
  "solana-compute-budget-instruction",
  "solana-compute-budget-program",
  "solana-fee-structure",

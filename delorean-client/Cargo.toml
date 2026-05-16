@@ -24,6 +24,7 @@ solana-account = { workspace = true }
 solana-address = { workspace = true }
 solana-bls-signatures = { workspace = true }
 solana-bpf-loader-program = { workspace = true, features = ["metrics"] }
+solana-compute-budget = { workspace = true }
 solana-compute-budget-instruction = { workspace = true }
 solana-compute-budget-program = { workspace = true }
 solana-fee-structure = { workspace = true }

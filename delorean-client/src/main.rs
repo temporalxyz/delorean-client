@@ -7,6 +7,7 @@ use {
     serde_json::json,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
     solana_bpf_loader_program as _,
+    solana_compute_budget::compute_budget::ComputeBudget,
     solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
     solana_fee_structure::FeeDetails,
     solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState},
@@ -340,12 +341,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         false,
     )?);
     let loader_v2 = Arc::new(create_program_runtime_environment_v2(&svm_budget, false));
-    let batch_processor = TransactionBatchProcessor::<ReplayForkGraph>::new(
+    let mut batch_processor = TransactionBatchProcessor::<ReplayForkGraph>::new(
         fixture.slot,
         0,
         Arc::downgrade(&fork_graph),
         Some(loader_v1),
         Some(loader_v2),
+    );
+    // Match Bank::apply_simd_0339_invoke_cost_changes — InvokeContext must use the same
+    // `invoke_units` (SIMD-0339) and stack depth budget (SIMD-0268) as a real bank.
+    let simd_0268_active =
+        agave_feature_set.is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id());
+    let simd_0339_active =
+        agave_feature_set.is_active(&agave_feature_set::increase_cpi_account_info_limit::id());
+    batch_processor.set_execution_cost(
+        ComputeBudget::new_with_defaults(simd_0268_active, simd_0339_active).to_cost(),
     );
     register_builtins(&bank, &batch_processor);
     batch_processor.fill_missing_sysvar_cache_entries(&bank);
