@@ -1,6 +1,6 @@
 # `delorean`: a client for Temporal's historical account data service service
 
-`delorean` is Temporal's historical account data service, currently in alpha with a handful of testers.
+`delorean` is a client for penrose — Temporal's historical account data service — which is currently in alpha with a handful of testers.
 
 ## Usage
 
