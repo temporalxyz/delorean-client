@@ -1358,6 +1358,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "delorean-client"
+version = "4.0.0-rc.0"
+dependencies = [
+ "agave-feature-set",
+ "agave-penrose-types",
+ "agave-reserved-account-keys",
+ "agave-syscalls",
+ "ahash",
+ "base64 0.22.1",
+ "bincode",
+ "serde_json",
+ "solana-account",
+ "solana-address 2.5.0",
+ "solana-bls-signatures",
+ "solana-bpf-loader-program",
+ "solana-compute-budget-instruction",
+ "solana-compute-budget-program",
+ "solana-fee-structure",
+ "solana-loader-v3-interface",
+ "solana-loader-v4-interface",
+ "solana-message",
+ "solana-program-runtime",
+ "solana-pubkey 4.2.0",
+ "solana-rent 3.1.0",
+ "solana-rpc-client",
+ "solana-rpc-client-api",
+ "solana-runtime",
+ "solana-sdk-ids",
+ "solana-signature",
+ "solana-svm",
+ "solana-svm-callback",
+ "solana-svm-feature-set",
+ "solana-svm-transaction",
+ "solana-system-program",
+ "solana-transaction",
+ "solana-transaction-context",
+ "solana-transaction-error",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2994,46 +3034,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83a0692ec44e4cf1ef28ca317f14f8f07da2d95ec3fa01f86e4467b725e60917"
 dependencies = [
  "digest 0.10.7",
-]
-
-[[package]]
-name = "penrose-client"
-version = "4.0.0-rc.0"
-dependencies = [
- "agave-feature-set",
- "agave-penrose-types",
- "agave-reserved-account-keys",
- "agave-syscalls",
- "ahash",
- "base64 0.22.1",
- "bincode",
- "serde_json",
- "solana-account",
- "solana-address 2.5.0",
- "solana-bls-signatures",
- "solana-bpf-loader-program",
- "solana-compute-budget-instruction",
- "solana-compute-budget-program",
- "solana-fee-structure",
- "solana-loader-v3-interface",
- "solana-loader-v4-interface",
- "solana-message",
- "solana-program-runtime",
- "solana-pubkey 4.2.0",
- "solana-rent 3.1.0",
- "solana-rpc-client",
- "solana-rpc-client-api",
- "solana-runtime",
- "solana-sdk-ids",
- "solana-signature",
- "solana-svm",
- "solana-svm-callback",
- "solana-svm-feature-set",
- "solana-svm-transaction",
- "solana-system-program",
- "solana-transaction",
- "solana-transaction-context",
- "solana-transaction-error",
 ]
 
 [[package]]

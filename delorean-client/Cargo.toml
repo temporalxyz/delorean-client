@@ -1,5 +1,5 @@
 [package]
-name = "penrose-client"
+name = "delorean-client"
 description = "CLI: fetch a penrose TransactionFixture over RPC and replay it locally against the SVM (status, CUs, return data, post-accounts)"
 version = { workspace = true }
 authors = { workspace = true }
@@ -9,7 +9,7 @@ license = { workspace = true }
 edition = { workspace = true }
 
 [[bin]]
-name = "penrose-client"
+name = "delorean"
 path = "src/main.rs"
 
 [dependencies]

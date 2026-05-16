@@ -99,24 +99,38 @@ struct ProgramReplacement {
     elf_path: PathBuf,
 }
 
+fn parse_one_program_replacement(spec: &str, flag_span: &str) -> Result<ProgramReplacement, String> {
+    let (key, path) = spec.split_once(':').ok_or_else(|| {
+        format!("--replace-program: expected <PUBKEY>:<PATH>, got `{flag_span}`")
+    })?;
+    let program_id: Pubkey = key
+        .parse()
+        .map_err(|e| format!("--replace-program: bad pubkey `{key}`: {e}"))?;
+    Ok(ProgramReplacement {
+        program_id,
+        elf_path: PathBuf::from(path),
+    })
+}
+
 fn parse_args(args: &[String]) -> Result<(Signature, String, Vec<ProgramReplacement>), String> {
     let mut replace_programs = Vec::new();
     let mut positionals = Vec::new();
 
-    for arg in args.iter().skip(1) {
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
         if let Some(rest) = arg.strip_prefix("--replace-program=") {
-            let (key, path) = rest.split_once(':').ok_or_else(|| {
-                format!("--replace-program: expected <PUBKEY>:<PATH>, got `{arg}`")
+            replace_programs.push(parse_one_program_replacement(rest, arg)?);
+            i += 1;
+        } else if arg == "--replace-program" {
+            let next = args.get(i + 1).ok_or_else(|| {
+                "--replace-program: missing value <PUBKEY>:<PATH>".to_string()
             })?;
-            let program_id: Pubkey = key
-                .parse()
-                .map_err(|e| format!("--replace-program: bad pubkey `{key}`: {e}"))?;
-            replace_programs.push(ProgramReplacement {
-                program_id,
-                elf_path: PathBuf::from(path),
-            });
+            replace_programs.push(parse_one_program_replacement(next, next)?);
+            i += 2;
         } else {
             positionals.push(arg.clone());
+            i += 1;
         }
     }
 
@@ -288,13 +302,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(v) => v,
         Err(msg) => {
             eprintln!(
-                "usage: {} [--replace-program=<PUBKEY>:<PATH_TO_ELF> ...] <signature_base58> \
-                     [rpc_url]\n\npositional:\nsignature_base58  the tx signature to \
-                     replay\nrpc_url           optional; defaults to \
-                     {DEFAULT_RPC_URL}\n\noptions:\n--replace-program=<PUBKEY>:<PATH>  replace \
+                "usage: {} [--replace-program=<PUBKEY>:<PATH> | --replace-program <PUBKEY>:<PATH> ...] \
+                     <signature_base58> [rpc_url]\n\npositional:\nsignature_base58  the tx signature \
+                     to replay\nrpc_url           optional; defaults to \
+                     {DEFAULT_RPC_URL}\n\noptions:\n--replace-program=… / --replace-program …  replace \
                      deployed ELF (loader-v1/v2 inline; v3 = patch programdata; v4 = patch \
                      tail)\n\nerror: {msg}",
-                args.first().map(String::as_str).unwrap_or("penrose-client"),
+                args.first().map(String::as_str).unwrap_or("delorean"),
             );
             process::exit(2);
         }
