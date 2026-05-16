@@ -1,0 +1,33 @@
+[package]
+name = "agave-penrose-types"
+description = "Minimal vendored schema/decode crate for penrose replays"
+readme = "README.md"
+documentation = "https://docs.rs/agave-penrose-types"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[lib]
+crate-type = ["lib"]
+name = "agave_penrose_types"
+
+[features]
+agave-unstable-api = []
+
+[dependencies]
+bincode = { workspace = true }
+solana-hash = { workspace = true, features = ["copy", "wincode"] }
+solana-pubkey = { workspace = true, features = ["wincode"] }
+solana-signature = { workspace = true, features = ["wincode"] }
+solana-version = { workspace = true }
+thiserror = { workspace = true }
+wincode = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,52 @@
+[package]
+name = "penrose-client"
+description = "CLI: fetch a penrose TransactionFixture over RPC and replay it locally against the SVM (status, CUs, return data, post-accounts)"
+version = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+
+[[bin]]
+name = "penrose-client"
+path = "src/main.rs"
+
+[dependencies]
+agave-feature-set = { workspace = true }
+agave-penrose-types = { workspace = true }
+agave-reserved-account-keys = { workspace = true }
+ahash = { workspace = true }
+base64 = { workspace = true }
+bincode = { workspace = true }
+serde_json = { workspace = true }
+solana-account = { workspace = true }
+solana-address = { workspace = true }
+solana-bls-signatures = { workspace = true }
+solana-bpf-loader-program = { workspace = true, features = ["metrics"] }
+solana-compute-budget-instruction = { workspace = true }
+solana-compute-budget-program = { workspace = true }
+solana-fee-structure = { workspace = true }
+solana-loader-v3-interface = { workspace = true }
+solana-loader-v4-interface = { workspace = true }
+solana-message = { workspace = true }
+solana-program-runtime = { workspace = true }
+solana-pubkey = { workspace = true, features = ["wincode"] }
+solana-rent = { workspace = true }
+solana-rpc-client = { workspace = true }
+solana-rpc-client-api = { workspace = true }
+solana-runtime = { workspace = true, features = ["dev-context-only-utils"] }
+solana-sdk-ids = { workspace = true }
+solana-signature = { workspace = true, features = ["wincode"] }
+solana-svm = { workspace = true, features = ["dev-context-only-utils"] }
+solana-svm-callback = { workspace = true }
+solana-svm-transaction = { workspace = true }
+solana-svm-feature-set = { workspace = true }
+agave-syscalls = { workspace = true }
+solana-system-program = { workspace = true }
+solana-transaction = { workspace = true, features = ["blake3", "serde"] }
+solana-transaction-context = { workspace = true }
+solana-transaction-error = { workspace = true, features = ["serde"] }
+
+[lints]
+workspace = true
