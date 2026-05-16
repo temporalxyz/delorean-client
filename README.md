@@ -21,3 +21,5 @@ To try swapping programs, use
 ```bash
 delorean <SIGNATURE> <TEMPORAL_PENROSE_URL> --replace-program=<PUBKEY>:<PATH_TO_REPLACEMENT>
 ```
+
+This is just a reference client implementation. Feel free to store fixtures and create other clients that e.g. swap/mutate non-program accounts as well.
