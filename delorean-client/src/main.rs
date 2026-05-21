@@ -1,5 +1,6 @@
 use {
     agave_feature_set::FeatureSet,
+    agave_precompiles::{get_precompile, get_precompiles, is_precompile},
     agave_penrose_types::{
         FixtureAccount, FixtureProgramData, FixtureSysvar, TransactionFixture,
         TransactionFixturesBatch,
@@ -10,10 +11,10 @@ use {
     },
     ahash::{AHashMap, AHashSet},
     base64::prelude::*,
+    flate2::read::GzDecoder,
     serde_json::json,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
     solana_bpf_loader_program as _,
-    solana_commitment_config::CommitmentConfig,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
     solana_fee_structure::FeeDetails,
@@ -28,14 +29,9 @@ use {
         invoke_context::BuiltinFunctionWithContext,
         loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
     },
+    solana_precompile_error::PrecompileError,
     solana_pubkey::Pubkey,
     solana_rent::Rent,
-    solana_rpc_client::rpc_client::RpcClient,
-    solana_rpc_client_api::{
-        client_error::{Error as ClientError, ErrorKind as ClientErrorKind},
-        config::RpcBlockConfig,
-        request::RpcRequest,
-    },
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, compute_budget, loader_v4,
         native_loader, vote,
@@ -53,24 +49,185 @@ use {
     },
     solana_svm_callback::{AccountState, InvokeContextCallback, TransactionProcessingCallback},
     solana_svm_feature_set::SVMFeatureSet,
-    solana_svm_transaction::svm_message::SVMStaticMessage,
+    solana_svm_transaction::svm_message::{SVMMessage, SVMStaticMessage},
     solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction},
     solana_transaction_context::transaction::TransactionReturnData,
-    solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding},
+    solana_transaction_error::TransactionError,
     std::{
         cmp::Ordering,
         collections::HashMap,
         env, fs,
+        io::{IsTerminal, Read, stdout},
         path::{Path, PathBuf},
         process,
         sync::{Arc, RwLock},
-        time::Instant,
+        time::{Duration, Instant},
     },
 };
 
 mod synthetic_accounts;
 
 const DEFAULT_RPC_URL: &str = "http://localhost:8899";
+/// Large block batches can take a while to serialize and gzip on penrose-server.
+const PENROSE_RPC_TIMEOUT: Duration = Duration::from_secs(300);
+
+type RpcError = Box<dyn std::error::Error>;
+
+struct RpcTransfer {
+    wire_bytes: usize,
+    json_bytes: usize,
+}
+
+impl RpcTransfer {
+    /// Negative when gzip shrinks the HTTP body (e.g. -93% = wire is 93% smaller than JSON).
+    fn wire_size_pct(&self) -> f64 {
+        if self.json_bytes == 0 {
+            return 0.0;
+        }
+        (self.wire_bytes as f64 / self.json_bytes as f64 - 1.0) * 100.0
+    }
+
+    fn log_suffix(&self) -> String {
+        if self.wire_bytes < self.json_bytes {
+            format!(
+                "; {} B wire → {} B json ({:+.1}% wire size)",
+                self.wire_bytes,
+                self.json_bytes,
+                self.wire_size_pct()
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
+struct RpcCall<T> {
+    value: T,
+    transfer: RpcTransfer,
+}
+
+struct JsonRpcClient {
+    url: String,
+    client: reqwest::blocking::Client,
+}
+
+impl JsonRpcClient {
+    fn new(url: impl ToString) -> Self {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(PENROSE_RPC_TIMEOUT)
+            .gzip(false)
+            .build()
+            .expect("build json-rpc client");
+        Self {
+            url: url.to_string(),
+            client,
+        }
+    }
+
+    fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<RpcCall<serde_json::Value>, RpcError> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1u64,
+            "method": method,
+            "params": params,
+        });
+        let response = self
+            .client
+            .post(&self.url)
+            .header(reqwest::header::ACCEPT_ENCODING, "gzip")
+            .json(&body)
+            .send()?;
+        let gzip = response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("gzip"));
+        let wire_bytes = response.bytes()?.to_vec();
+        let wire_len = wire_bytes.len();
+        let json_bytes = if gzip {
+            let mut decoder = GzDecoder::new(wire_bytes.as_slice());
+            let mut decompressed = Vec::new();
+            decoder.read_to_end(&mut decompressed)?;
+            decompressed
+        } else {
+            wire_bytes
+        };
+        let json_len = json_bytes.len();
+        let resp: serde_json::Value = serde_json::from_slice(&json_bytes)?;
+        if let Some(err) = resp.get("error") {
+            return Err(format!("json-rpc {method} error: {err}").into());
+        }
+        Ok(RpcCall {
+            value: resp["result"].clone(),
+            transfer: RpcTransfer {
+                wire_bytes: wire_len,
+                json_bytes: json_len,
+            },
+        })
+    }
+}
+
+fn block_transaction_base64(tx: &serde_json::Value) -> Option<&str> {
+    let field = tx.get("transaction")?;
+    if let Some(arr) = field.as_array() {
+        arr.first()?.as_str()
+    } else {
+        field.as_str()
+    }
+}
+
+fn fetch_non_vote_signatures_from_block(
+    rpc_url: &str,
+    slot: u64,
+) -> Result<(Vec<Signature>, u32, u32), RpcError> {
+    let rpc = JsonRpcClient::new(rpc_url);
+    let RpcCall {
+        value: result,
+        transfer: _,
+    } = rpc.call(
+        "getBlock",
+        json!([
+            slot,
+            {
+                "encoding": "base64",
+                "transactionDetails": "full",
+                "rewards": false,
+                "maxSupportedTransactionVersion": 0,
+                "commitment": "confirmed",
+            }
+        ]),
+    )?;
+    if result.is_null() {
+        return Err(format!("getBlock: slot {slot} not available (null result)").into());
+    }
+    let txs = result
+        .get("transactions")
+        .and_then(|v| v.as_array())
+        .ok_or("getBlock: missing transactions array")?;
+    let mut signatures = Vec::new();
+    let mut total_txs = 0u32;
+    let mut vote_txs = 0u32;
+    for tx in txs {
+        total_txs += 1;
+        let Some(b64) = block_transaction_base64(tx) else {
+            continue;
+        };
+        let bytes = BASE64_STANDARD.decode(b64)?;
+        let versioned: VersionedTransaction = bincode::deserialize(&bytes)?;
+        if is_simple_vote_transaction(&versioned) {
+            vote_txs += 1;
+            continue;
+        }
+        if let Some(sig) = versioned.signatures.first() {
+            signatures.push(*sig);
+        }
+    }
+    Ok((signatures, total_txs, vote_txs))
+}
 
 /// Penrose captures non-vote transactions only; mirror the usual simple-vote check.
 fn is_simple_vote_transaction(tx: &VersionedTransaction) -> bool {
@@ -84,85 +241,247 @@ fn is_simple_vote_transaction(tx: &VersionedTransaction) -> bool {
 }
 
 fn get_transaction_fixture(
-    rpc: &RpcClient,
+    rpc: &JsonRpcClient,
     signature: &Signature,
-) -> Result<Option<TransactionFixture>, ClientError> {
+) -> Result<Option<TransactionFixture>, RpcError> {
     let total = Instant::now();
     let rpc_started = Instant::now();
-    let encoded: Option<String> = rpc.send(
-        RpcRequest::Custom {
-            method: "getTransactionFixture",
-        },
+    let RpcCall {
+        value: result,
+        transfer,
+    } = rpc.call(
+        "getTransactionFixture",
         json!([signature.to_string()]),
     )?;
     let rpc_elapsed = rpc_started.elapsed();
-    let Some(b64) = encoded else {
+    let Some(b64) = result.as_str() else {
         println!(
-            "fixture fetch: {:.3}s (rpc only, no fixture stored)",
-            rpc_elapsed.as_secs_f64()
+            "fixture fetch: {:.3}s (rpc only, no fixture stored){}",
+            rpc_elapsed.as_secs_f64(),
+            transfer.log_suffix()
         );
         return Ok(None);
     };
     let decode_started = Instant::now();
-    let bytes = BASE64_STANDARD.decode(&b64).map_err(|e| {
-        ClientError::from(ClientErrorKind::Custom(format!(
-            "getTransactionFixture: server returned non-base64 payload: {e}"
-        )))
-    })?;
-    let fixture = TransactionFixture::deserialize(&bytes).map_err(|e| {
-        ClientError::from(ClientErrorKind::Custom(format!(
-            "getTransactionFixture: failed to decode fixture bytes: {e}"
-        )))
-    })?;
+    let bytes = BASE64_STANDARD
+        .decode(b64)
+        .map_err(|e| format!("getTransactionFixture: non-base64 payload: {e}"))?;
+    let fixture = TransactionFixture::deserialize(&bytes)
+        .map_err(|e| format!("getTransactionFixture: failed to decode fixture bytes: {e}"))?;
     let decode_elapsed = decode_started.elapsed();
     println!(
-        "fixture fetch: {:.3}s total (rpc {:.3}s, decode {:.3}s; {} B base64, {} B fixture)",
+        "fixture fetch: {:.3}s total (rpc {:.3}s, decode {:.3}s; {} B base64, {} B fixture{})",
         total.elapsed().as_secs_f64(),
         rpc_elapsed.as_secs_f64(),
         decode_elapsed.as_secs_f64(),
         b64.len(),
         bytes.len(),
+        transfer.log_suffix()
     );
     Ok(Some(fixture))
 }
 
 fn get_transaction_fixtures_batch(
-    rpc: &RpcClient,
+    rpc: &JsonRpcClient,
     signatures: &[Signature],
-) -> Result<TransactionFixturesBatch, ClientError> {
+    log_timing: bool,
+) -> Result<TransactionFixturesBatch, RpcError> {
     let total = Instant::now();
     let sig_strings: Vec<String> = signatures.iter().map(|s| s.to_string()).collect();
     let rpc_started = Instant::now();
-    let encoded: String = rpc.send(
-        RpcRequest::Custom {
-            method: "getTransactionFixtures",
-        },
-        json!([sig_strings]),
-    )?;
+    let RpcCall {
+        value: result,
+        transfer,
+    } = rpc.call("getTransactionFixtures", json!([sig_strings]))?;
+    let encoded = result
+        .as_str()
+        .ok_or("getTransactionFixtures: expected base64 string result")?;
     let rpc_elapsed = rpc_started.elapsed();
     let decode_started = Instant::now();
-    let bytes = BASE64_STANDARD.decode(&encoded).map_err(|e| {
-        ClientError::from(ClientErrorKind::Custom(format!(
-            "getTransactionFixtures: server returned non-base64 payload: {e}"
-        )))
-    })?;
-    let batch = TransactionFixturesBatch::deserialize(&bytes).map_err(|e| {
-        ClientError::from(ClientErrorKind::Custom(format!(
-            "getTransactionFixtures: failed to decode batch bytes: {e}"
-        )))
-    })?;
+    let bytes = BASE64_STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("getTransactionFixtures: non-base64 payload: {e}"))?;
+    let batch = TransactionFixturesBatch::deserialize(&bytes)
+        .map_err(|e| format!("getTransactionFixtures: failed to decode batch bytes: {e}"))?;
     let decode_elapsed = decode_started.elapsed();
-    println!(
-        "fixture batch fetch: {:.3}s total (rpc {:.3}s, decode {:.3}s; {} signatures, {} unique \
-         blobs, {} B wire)",
-        total.elapsed().as_secs_f64(),
-        rpc_elapsed.as_secs_f64(),
-        decode_elapsed.as_secs_f64(),
-        signatures.len(),
-        batch.blobs.len(),
-        encoded.len(),
-    );
+    let transfer_suffix = transfer.log_suffix();
+    if log_timing {
+        println!(
+            "fixture batch fetch: {:.3}s total (rpc {:.3}s, decode {:.3}s; {} signatures, {} \
+             unique blobs, {} B base64{})",
+            total.elapsed().as_secs_f64(),
+            rpc_elapsed.as_secs_f64(),
+            decode_elapsed.as_secs_f64(),
+            signatures.len(),
+            batch.blobs.len(),
+            encoded.len(),
+            transfer_suffix
+        );
+    } else {
+        println!(
+            "fixture batch fetch: {} signatures, {} unique blobs, {} B base64{}",
+            signatures.len(),
+            batch.blobs.len(),
+            encoded.len(),
+            transfer_suffix
+        );
+    }
     Ok(batch)
+}
+
+struct BlockArgs {
+    verbose: bool,
+    slot: u64,
+    solana_rpc_url: String,
+    penrose_rpc_url: String,
+}
+
+fn parse_block_args(args: &[String]) -> Result<BlockArgs, String> {
+    let mut verbose = false;
+    let mut positional = Vec::new();
+    for arg in args.iter().skip(2) {
+        match arg.as_str() {
+            "-v" | "--verbose" => verbose = true,
+            other => positional.push(other.to_string()),
+        }
+    }
+    if positional.len() < 2 {
+        return Err("expected <slot> and <solana_rpc_url>".into());
+    }
+    let slot: u64 = positional[0]
+        .parse()
+        .map_err(|e| format!("bad slot `{}`: {e}", positional[0]))?;
+    let solana_rpc_url = positional[1].clone();
+    let penrose_rpc_url = positional
+        .get(2)
+        .cloned()
+        .or_else(|| env::var("PENROSE_RPC").ok())
+        .unwrap_or_else(|| solana_rpc_url.clone());
+    Ok(BlockArgs {
+        verbose,
+        slot,
+        solana_rpc_url,
+        penrose_rpc_url,
+    })
+}
+
+struct ReplayCompare {
+    status_match: Option<bool>,
+    cu_match: Option<bool>,
+    state_match: Option<bool>,
+    pass: bool,
+}
+
+const BLOCK_SIG_WIDTH: usize = 88;
+const BLOCK_STATUS_WIDTH: usize = 6;
+const BLOCK_MATCH_WIDTH: usize = 5;
+const BLOCK_RESULT_WIDTH: usize = 6;
+
+fn color_enabled() -> bool {
+    !env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
+        && stdout().is_terminal()
+}
+
+fn colorize(text: &str, color: &str) -> String {
+    if color_enabled() {
+        format!("{color}{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn signature_cell(signature: &Signature) -> String {
+    format!("{:<BLOCK_SIG_WIDTH$}", signature.to_string())
+}
+
+fn match_cell(m: Option<bool>, width: usize) -> String {
+    let (label, color) = match m {
+        Some(true) => ("match", "\x1b[32m"),
+        Some(false) => ("miss", "\x1b[31m"),
+        None => ("n/a", "\x1b[90m"),
+    };
+    colorize(&format!("{label:>width$}"), color)
+}
+
+fn result_cell(pass: bool) -> String {
+    let (label, color) = if pass {
+        ("PASS", "\x1b[32m")
+    } else {
+        ("FAIL", "\x1b[31m")
+    };
+    colorize(&format!("{label:>BLOCK_RESULT_WIDTH$}"), color)
+}
+
+fn print_block_table_header() {
+    let header = format!(
+        "{:<BLOCK_SIG_WIDTH$} {:>BLOCK_STATUS_WIDTH$} {:>BLOCK_MATCH_WIDTH$} \
+         {:>BLOCK_MATCH_WIDTH$} {:>BLOCK_RESULT_WIDTH$}",
+        "SIGNATURE",
+        "STATUS",
+        "CU",
+        "STATE",
+        "RESULT"
+    );
+    println!("{}", colorize(&header, "\x1b[1m"));
+}
+
+fn print_block_table_row(signature: &Signature, cmp: &ReplayCompare) {
+    println!(
+        "{} {} {} {} {}",
+        signature_cell(signature),
+        match_cell(cmp.status_match, BLOCK_STATUS_WIDTH),
+        match_cell(cmp.cu_match, BLOCK_MATCH_WIDTH),
+        match_cell(cmp.state_match, BLOCK_MATCH_WIDTH),
+        result_cell(cmp.pass),
+    );
+}
+
+fn fixture_expected_status(fixture: &TransactionFixture) -> Result<(), TransactionError> {
+    bincode::deserialize(&fixture.result.status)
+        .unwrap_or(Err(TransactionError::AccountNotFound))
+}
+
+fn compare_replay(
+    fixture: &TransactionFixture,
+    message: &SanitizedTransaction,
+    results: &[solana_svm::transaction_processing_result::TransactionProcessingResult],
+) -> ReplayCompare {
+    let expected_status = fixture_expected_status(fixture);
+    let expected_cus = fixture.result.compute_units_consumed;
+
+    let Some(result) = results.first() else {
+        return ReplayCompare {
+            status_match: None,
+            cu_match: None,
+            state_match: None,
+            pass: false,
+        };
+    };
+
+    match result {
+        Ok(ProcessedTransaction::Executed(exec)) => {
+            let exec = exec.as_ref();
+            let actual_status = exec.execution_details.status.clone();
+            let status_match = actual_status.clone().map(|_| ()) == expected_status;
+            let actual_cus = exec.execution_details.executed_units;
+            let cu_match = actual_cus == expected_cus;
+            let (post_mismatches, _) = post_account_mismatches(fixture, exec, message);
+            let state_match = post_mismatches.is_empty();
+            let pass = status_match && cu_match && state_match;
+            ReplayCompare {
+                status_match: Some(status_match),
+                cu_match: Some(cu_match),
+                state_match: Some(state_match),
+                pass,
+            }
+        }
+        Ok(ProcessedTransaction::FeesOnly(_)) | Err(_) => ReplayCompare {
+            status_match: Some(false),
+            cu_match: None,
+            state_match: None,
+            pass: false,
+        },
+    }
 }
 
 fn main() {
@@ -387,74 +706,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    if args.len() < 4 {
-        eprintln!(
-            "usage: {} block <slot> <solana_rpc_url> [penrose_rpc_url]\n\n  slot             block \
-             slot to load via getBlock\n  solana_rpc_url   JSON-RPC for getBlock (validator)\n  \
-             penrose_rpc_url  JSON-RPC for getTransactionFixtures (penrose-server); defaults to \
-             $PENROSE_RPC or solana_rpc_url",
-            args.first().map(String::as_str).unwrap_or("delorean"),
-        );
-        process::exit(2);
-    }
-    let slot: u64 = args[2]
-        .parse()
-        .map_err(|e| format!("bad slot `{}`: {e}", args[2]))?;
-    let solana_rpc_url = args[3].clone();
-    let penrose_rpc_url = args
-        .get(4)
-        .cloned()
-        .or_else(|| env::var("PENROSE_RPC").ok())
-        .unwrap_or_else(|| solana_rpc_url.clone());
-
-    println!("connecting to {solana_rpc_url} for getBlock");
-    let solana_rpc = RpcClient::new(solana_rpc_url);
-    let block = solana_rpc.get_block_with_config(
-        slot,
-        RpcBlockConfig {
-            encoding: Some(UiTransactionEncoding::Base64),
-            transaction_details: Some(TransactionDetails::Full),
-            rewards: Some(false),
-            commitment: Some(CommitmentConfig::confirmed()),
-            max_supported_transaction_version: Some(0),
-            ..RpcBlockConfig::default()
-        },
-    )?;
-
-    let mut signatures: Vec<Signature> = Vec::new();
-    let mut total_txs = 0u32;
-    let mut vote_txs = 0u32;
-    if let Some(txs) = block.transactions {
-        for tx in txs {
-            total_txs += 1;
-            let encoded = &tx.transaction;
-            let Some(versioned) = encoded.decode() else {
-                continue;
-            };
-            if is_simple_vote_transaction(&versioned) {
-                vote_txs += 1;
-                continue;
-            }
-            let Some(sig) = versioned.signatures.first() else {
-                continue;
-            };
-            signatures.push(*sig);
+    let block_args = match parse_block_args(args) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!(
+                "usage: {} block [-v] <slot> <solana_rpc_url> [penrose_rpc_url]\n\n  -v  verbose \
+                 replay (fixture summary, logs, account diffs)\n\n  slot             block slot to \
+                 load via getBlock\n  solana_rpc_url   JSON-RPC for getBlock (validator)\n  \
+                 penrose_rpc_url  JSON-RPC for getTransactionFixtures (penrose-server); defaults \
+                 to $PENROSE_RPC or solana_rpc_url\n\nerror: {msg}",
+                args.first().map(String::as_str).unwrap_or("delorean"),
+            );
+            process::exit(2);
         }
+    };
+    let BlockArgs {
+        verbose,
+        slot,
+        solana_rpc_url,
+        penrose_rpc_url,
+    } = block_args;
+
+    if verbose {
+        println!("connecting to {solana_rpc_url} for getBlock");
     }
+    let (signatures, total_txs, vote_txs) =
+        fetch_non_vote_signatures_from_block(&solana_rpc_url, slot)?;
 
     println!(
-        "block {slot}: {total_txs} transactions, {vote_txs} votes skipped, {} non-vote signatures",
+        "block {slot}: {total_txs} transactions, {vote_txs} votes skipped, {} non-vote",
         signatures.len()
     );
 
     if signatures.is_empty() {
-        println!("no non-vote transactions to fetch");
         return Ok(());
     }
 
-    println!("connecting to {penrose_rpc_url} for getTransactionFixtures");
-    let penrose_rpc = RpcClient::new(penrose_rpc_url);
-    let batch = get_transaction_fixtures_batch(&penrose_rpc, &signatures)?;
+    if verbose {
+        println!("connecting to {penrose_rpc_url} for getTransactionFixtures");
+    }
+    let penrose_rpc = JsonRpcClient::new(penrose_rpc_url);
+    let batch = get_transaction_fixtures_batch(&penrose_rpc, &signatures, verbose)?;
     if batch.fixtures.len() != signatures.len() {
         return Err(format!(
             "getTransactionFixtures returned {} fixtures for {} signatures",
@@ -465,24 +757,76 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut present = 0u32;
+    let mut pass = 0u32;
+    let mut fail = 0u32;
+    let mut missing = 0u32;
     let mut replayed = 0u32;
+    if !verbose {
+        print_block_table_header();
+    }
     for (signature, entry) in signatures.iter().zip(batch.fixtures.iter()) {
         let Some(batch_fixture) = entry else {
-            println!("{signature}: no penrose fixture");
+            missing += 1;
+            if verbose {
+                println!("{signature}: no penrose fixture");
+            } else {
+                print_block_table_row(
+                    signature,
+                    &ReplayCompare {
+                        status_match: None,
+                        cu_match: None,
+                        state_match: None,
+                        pass: false,
+                    },
+                );
+            }
             continue;
         };
         present += 1;
         let fixture = batch_fixture.clone().into_inlined(&batch.blobs);
-        println!("\n========== {signature} ==========");
-        print_fixture_summary(&fixture);
-        replay_fixture(&fixture, &[])?;
-        replayed += 1;
+        if verbose {
+            println!("\n========== {signature} ==========");
+            print_fixture_summary(&fixture);
+            replay_fixture(&fixture, &[], true)?;
+            replayed += 1;
+            continue;
+        }
+        match execute_fixture(&fixture, &[], verbose) {
+            Ok((sanitized, results)) => {
+                let cmp = compare_replay(&fixture, &sanitized, &results);
+                if cmp.pass {
+                    pass += 1;
+                } else {
+                    fail += 1;
+                }
+                print_block_table_row(signature, &cmp);
+            }
+            Err(_) => {
+                fail += 1;
+                print_block_table_row(
+                    signature,
+                    &ReplayCompare {
+                        status_match: Some(false),
+                        cu_match: None,
+                        state_match: None,
+                        pass: false,
+                    },
+                );
+            }
+        }
     }
 
-    println!(
-        "\nblock {slot} done: {} non-vote txs, {present} fixtures present, {replayed} replayed",
-        signatures.len()
-    );
+    if verbose {
+        println!(
+            "\nblock {slot} done: {} non-vote txs, {present} fixtures present, {replayed} replayed, {missing} missing",
+            signatures.len()
+        );
+    } else {
+        println!(
+            "block {slot} done: {} non-vote, {present} fixtures, {pass} pass, {fail} fail, {missing} missing",
+            signatures.len()
+        );
+    }
     Ok(())
 }
 
@@ -492,12 +836,14 @@ fn run_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Err(msg) => {
             eprintln!(
                 "usage: {} [replay] [--replace-program=<PUBKEY>:<PATH> | --replace-program \
-                     <PUBKEY>:<PATH> ...] <signature_base58> [rpc_url]\n       {} block <slot> \
+                     <PUBKEY>:<PATH> ...] <signature_base58> [rpc_url]\n       {} block [-v] <slot> \
                      <solana_rpc_url> [penrose_rpc_url]\n\nreplay:\n  signature_base58  tx to \
                      replay\n  rpc_url           penrose-server JSON-RPC; defaults to \
                      {DEFAULT_RPC_URL}\n\nblock:\n  fetches getBlock, skips votes, batch-fetches \
-                     fixtures via getTransactionFixtures, replays each present fixture\n\noptions:\n\
-                     --replace-program  replace deployed ELF before replay (replay mode only)\n\n\
+                     fixtures via getTransactionFixtures, replays each present fixture\n  default: \
+                     one line per tx (signature status cus state PASS|FAIL); -v for full output\n\n\
+                     options:\n  -v (block)        verbose block replay\n  --replace-program  replace \
+                     deployed ELF before replay (replay mode only)\n\n\
                      error: {msg}",
                 args.first().map(String::as_str).unwrap_or("delorean"),
                 args.first().map(String::as_str).unwrap_or("delorean"),
@@ -507,7 +853,7 @@ fn run_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("connecting to {rpc_url}");
-    let rpc = RpcClient::new(rpc_url);
+    let rpc = JsonRpcClient::new(rpc_url);
 
     println!("fetching fixture for {signature}");
     let fixture = get_transaction_fixture(&rpc, &signature)?.ok_or(
@@ -515,19 +861,63 @@ fn run_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     print_fixture_summary(&fixture);
-    replay_fixture(&fixture, &replace_programs)?;
+    replay_fixture(&fixture, &replace_programs, true)?;
     Ok(())
 }
 
-fn replay_fixture(
+fn print_instructions_after_sanitization(tx: &SanitizedTransaction) {
+    println!("\n--- instructions (after sanitization) ---");
+    let account_keys = tx.account_keys();
+    for (ix_index, (program_id, instruction)) in tx.program_instructions_iter().enumerate() {
+        let data_hex: String = if instruction.data.is_empty() {
+            "(empty)".to_string()
+        } else {
+            instruction
+                .data
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        println!("ix {ix_index}");
+        println!("  program: {program_id}");
+        println!("  data:    {data_hex}");
+        println!("  accounts:");
+        if instruction.accounts.is_empty() {
+            println!("    (none — precompile instructions use data only)");
+        } else {
+            println!("    {:<44} {:>6} {:>8}", "key", "signer", "writable");
+        }
+        for account_index in instruction.accounts.iter() {
+            let account_index = usize::from(*account_index);
+            let key = account_keys
+                .get(account_index)
+                .expect("instruction account index in message account list");
+            println!(
+                "    {:<44} {:>6} {:>8}",
+                key,
+                tx.is_signer(account_index),
+                tx.is_writable(account_index),
+            );
+        }
+    }
+}
+
+fn execute_fixture(
     fixture: &TransactionFixture,
     replace_programs: &[ProgramReplacement],
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("\nbuilding SVM environment...");
+    log_instructions: bool,
+) -> Result<
+    (
+        SanitizedTransaction,
+        Vec<solana_svm::transaction_processing_result::TransactionProcessingResult>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let rent = extract_rent(&fixture.sysvars);
-    let bank = build_mock_bank(fixture);
-    apply_program_replacements(&bank, &rent, replace_programs)?;
     let (agave_feature_set, feature_set) = feature_sets_from_fixture(&fixture.enabled_features);
+    let bank = build_mock_bank(fixture, agave_feature_set.clone());
+    apply_program_replacements(&bank, &rent, replace_programs)?;
     let svm_budget =
         SVMTransactionExecutionBudget::new_with_defaults(feature_set.raise_cpi_nesting_limit_to_8);
 
@@ -554,9 +944,9 @@ fn replay_fixture(
         ComputeBudget::new_with_defaults(simd_0268_active, simd_0339_active).to_cost(),
     );
     register_builtins(&bank, &batch_processor);
+    register_precompiles(&bank);
     batch_processor.fill_missing_sysvar_cache_entries(&bank);
 
-    println!("sanitizing transaction...");
     let versioned_tx: VersionedTransaction = bincode::deserialize(&fixture.transaction)?;
     let address_loader = SimpleAddressLoader::Enabled(LoadedAddresses {
         writable: fixture.alt_writable.clone(),
@@ -571,9 +961,12 @@ fn replay_fixture(
         &reserved,
     )?;
 
+    if log_instructions {
+        print_instructions_after_sanitization(&sanitized);
+    }
+
     let fee_details = replay_fee_details(fixture, &sanitized, &agave_feature_set);
 
-    println!("executing...\n");
     let env = TransactionProcessingEnvironment {
         blockhash: fixture.recent_blockhash,
         blockhash_lamports_per_signature: fixture.lamports_per_signature,
@@ -609,7 +1002,23 @@ fn replay_fixture(
         &cfg,
     );
 
-    print_outcome(fixture, &sanitized, &out.processing_results);
+    Ok((sanitized, out.processing_results))
+}
+
+fn replay_fixture(
+    fixture: &TransactionFixture,
+    replace_programs: &[ProgramReplacement],
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if verbose {
+        println!("\nbuilding SVM environment...");
+    }
+    let (sanitized, results) = execute_fixture(fixture, replace_programs, true)?;
+    if verbose {
+        println!("sanitizing transaction...");
+        println!("executing...\n");
+        print_outcome(fixture, &sanitized, &results);
+    }
     Ok(())
 }
 
@@ -916,8 +1325,8 @@ fn fixture_account_to_shared(fa: &FixtureAccount) -> AccountSharedData {
     })
 }
 
-fn build_mock_bank(f: &TransactionFixture) -> MockBank {
-    let bank = MockBank::default();
+fn build_mock_bank(f: &TransactionFixture, feature_set: FeatureSet) -> MockBank {
+    let bank = MockBank::new(feature_set);
     {
         let mut accounts = bank.accounts.write().unwrap();
 
@@ -925,11 +1334,13 @@ fn build_mock_bank(f: &TransactionFixture) -> MockBank {
             accounts.insert(fa.pubkey, fixture_account_to_shared(fa));
         }
 
+        let rent = extract_rent(&f.sysvars);
         for sv in f.sysvars.iter() {
             let mut acct = AccountSharedData::default();
             acct.set_data_from_slice(&sv.data);
             acct.set_owner(solana_sdk_ids::sysvar::id());
-            acct.set_lamports(1);
+            acct.set_lamports(rent.minimum_balance(sv.data.len()));
+            acct.set_rent_epoch(RENT_EXEMPT_RENT_EPOCH);
             accounts.insert(sv.sysvar_id, acct);
         }
 
@@ -987,16 +1398,50 @@ fn replay_fee_details(
 }
 
 fn rent_epochs_equivalent(fa: &FixtureAccount, actual: u64) -> bool {
-    actual == fa.rent_epoch
-        || (actual == 0 && fa.rent_epoch == RENT_EXEMPT_RENT_EPOCH && fa.is_executable())
+    if actual == fa.rent_epoch {
+        return true;
+    }
+    // Fixture snapshots from the validator bank often use u64::MAX for rent-exempt
+    // accounts; replay may report 0 until load normalization, or the reverse when
+    // an account becomes rent-exempt in the same transaction.
+    let max = RENT_EXEMPT_RENT_EPOCH;
+    (actual == 0 && fa.rent_epoch == max) || (actual == max && fa.rent_epoch == 0)
 }
 
-#[derive(Default)]
 struct MockBank {
     accounts: RwLock<HashMap<Pubkey, AccountSharedData>>,
+    feature_set: FeatureSet,
 }
 
-impl InvokeContextCallback for MockBank {}
+impl MockBank {
+    fn new(feature_set: FeatureSet) -> Self {
+        Self {
+            accounts: RwLock::new(HashMap::new()),
+            feature_set,
+        }
+    }
+}
+
+impl InvokeContextCallback for MockBank {
+    fn is_precompile(&self, program_id: &Pubkey) -> bool {
+        is_precompile(program_id, |feature_id| self.feature_set.is_active(feature_id))
+    }
+
+    fn process_precompile(
+        &self,
+        program_id: &Pubkey,
+        data: &[u8],
+        instruction_datas: Vec<&[u8]>,
+    ) -> Result<(), PrecompileError> {
+        if let Some(precompile) = get_precompile(program_id, |feature_id| {
+            self.feature_set.is_active(feature_id)
+        }) {
+            precompile.verify(data, &instruction_datas, &self.feature_set)
+        } else {
+            Err(PrecompileError::InvalidPublicKey)
+        }
+    }
+}
 
 impl TransactionProcessingCallback for MockBank {
     fn get_account_shared_data(&self, pubkey: &Pubkey) -> Option<(AccountSharedData, u64)> {
@@ -1021,6 +1466,34 @@ impl ForkGraph for ReplayForkGraph {
             Ordering::Greater => BlockRelation::Descendant,
         }
     }
+}
+
+/// Mirror [`Bank::add_precompile`]: bogus executable native-loader accounts the SVM
+/// loads then routes through [`InvokeContextCallback::process_precompile`].
+fn register_precompiles(bank: &MockBank) {
+    for precompile in get_precompiles() {
+        if precompile
+            .feature
+            .is_none_or(|feature_id| bank.feature_set.is_active(&feature_id))
+        {
+            install_precompiled_account(bank, &precompile.program_id);
+        }
+    }
+}
+
+fn install_precompiled_account(bank: &MockBank, program_id: &Pubkey) {
+    let mut accounts = bank.accounts.write().unwrap();
+    if accounts
+        .get(program_id)
+        .is_some_and(|acct| acct.executable() && native_loader::check_id(acct.owner()))
+    {
+        return;
+    }
+    let mut acct = AccountSharedData::default();
+    acct.set_owner(native_loader::id());
+    acct.set_executable(true);
+    acct.set_lamports(1);
+    accounts.insert(*program_id, acct);
 }
 
 fn register_builtins(bank: &MockBank, processor: &TransactionBatchProcessor<ReplayForkGraph>) {
