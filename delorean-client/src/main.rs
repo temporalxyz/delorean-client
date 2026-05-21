@@ -705,6 +705,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     run_replay(&args)
 }
 
+fn tally_match_field(m: Option<bool>, ok: &mut u32, total: &mut u32) {
+    if let Some(matched) = m {
+        *total += 1;
+        if matched {
+            *ok += 1;
+        }
+    }
+}
+
 fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let block_args = match parse_block_args(args) {
         Ok(v) => v,
@@ -758,9 +767,14 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut present = 0u32;
     let mut pass = 0u32;
-    let mut fail = 0u32;
     let mut missing = 0u32;
     let mut replayed = 0u32;
+    let mut status_ok = 0u32;
+    let mut status_total = 0u32;
+    let mut cu_ok = 0u32;
+    let mut cu_total = 0u32;
+    let mut state_ok = 0u32;
+    let mut state_total = 0u32;
     if !verbose {
         print_block_table_header();
     }
@@ -794,15 +808,16 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match execute_fixture(&fixture, &[], verbose) {
             Ok((sanitized, results)) => {
                 let cmp = compare_replay(&fixture, &sanitized, &results);
+                tally_match_field(cmp.status_match, &mut status_ok, &mut status_total);
+                tally_match_field(cmp.cu_match, &mut cu_ok, &mut cu_total);
+                tally_match_field(cmp.state_match, &mut state_ok, &mut state_total);
                 if cmp.pass {
                     pass += 1;
-                } else {
-                    fail += 1;
                 }
                 print_block_table_row(signature, &cmp);
             }
             Err(_) => {
-                fail += 1;
+                tally_match_field(Some(false), &mut status_ok, &mut status_total);
                 print_block_table_row(
                     signature,
                     &ReplayCompare {
@@ -822,8 +837,12 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             signatures.len()
         );
     } else {
+        let mismatches = (status_total - status_ok) + (cu_total - cu_ok) + (state_total - state_ok);
         println!(
-            "block {slot} done: {} non-vote, {present} fixtures, {pass} pass, {fail} fail, {missing} missing",
+            "block {slot} done: {} non-vote, {present} fixtures, \
+             status {status_ok}/{status_total}, cu {cu_ok}/{cu_total}, \
+             state {state_ok}/{state_total}, pass {pass}/{present}, \
+             {mismatches} mismatches, {missing} missing",
             signatures.len()
         );
     }
