@@ -44,9 +44,7 @@ pub fn validate_post_account(
     message: &SanitizedTransaction,
 ) -> Result<(), String> {
     match kind {
-        SyntheticAccountKind::InstructionsSysvar => {
-            validate_instructions_sysvar(actual, message)
-        }
+        SyntheticAccountKind::InstructionsSysvar => validate_instructions_sysvar(actual, message),
     }
 }
 

@@ -1,8 +1,8 @@
-use wincode::{SchemaRead, SchemaWrite};
+use wincode::SchemaRead;
 
 pub(crate) const BLOB_HASH_LEN: usize = 32;
 
-#[derive(SchemaWrite, SchemaRead)]
+#[derive(SchemaRead)]
 pub enum FixtureBlob {
     Inline(Vec<u8>),
     Hash([u8; BLOB_HASH_LEN]),

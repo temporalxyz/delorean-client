@@ -1,6 +1,9 @@
 use {
     agave_feature_set::FeatureSet,
-    agave_penrose_types::{FixtureAccount, FixtureProgramData, FixtureSysvar, TransactionFixture},
+    agave_penrose_types::{
+        FixtureAccount, FixtureProgramData, FixtureSysvar, TransactionFixture,
+        TransactionFixturesBatch,
+    },
     agave_reserved_account_keys::ReservedAccountKeys,
     agave_syscalls::{
         create_program_runtime_environment_v1, create_program_runtime_environment_v2,
@@ -10,6 +13,7 @@ use {
     serde_json::json,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
     solana_bpf_loader_program as _,
+    solana_commitment_config::CommitmentConfig,
     solana_compute_budget::compute_budget::ComputeBudget,
     solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
     solana_fee_structure::FeeDetails,
@@ -29,11 +33,12 @@ use {
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{
         client_error::{Error as ClientError, ErrorKind as ClientErrorKind},
+        config::RpcBlockConfig,
         request::RpcRequest,
     },
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, compute_budget, loader_v4,
-        native_loader,
+        native_loader, vote,
     },
     solana_signature::Signature,
     solana_svm::{
@@ -51,6 +56,7 @@ use {
     solana_svm_transaction::svm_message::SVMStaticMessage,
     solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction},
     solana_transaction_context::transaction::TransactionReturnData,
+    solana_transaction_status_client_types::{TransactionDetails, UiTransactionEncoding},
     std::{
         cmp::Ordering,
         collections::HashMap,
@@ -65,6 +71,17 @@ use {
 mod synthetic_accounts;
 
 const DEFAULT_RPC_URL: &str = "http://localhost:8899";
+
+/// Penrose captures non-vote transactions only; mirror the usual simple-vote check.
+fn is_simple_vote_transaction(tx: &VersionedTransaction) -> bool {
+    let keys = tx.message.static_account_keys();
+    !tx.message.instructions().is_empty()
+        && tx.message.instructions().iter().all(|ix| {
+            keys.get(ix.program_id_index as usize)
+                .map(|k| vote::check_id(k))
+                .unwrap_or(false)
+        })
+}
 
 fn get_transaction_fixture(
     rpc: &RpcClient,
@@ -107,6 +124,45 @@ fn get_transaction_fixture(
         bytes.len(),
     );
     Ok(Some(fixture))
+}
+
+fn get_transaction_fixtures_batch(
+    rpc: &RpcClient,
+    signatures: &[Signature],
+) -> Result<TransactionFixturesBatch, ClientError> {
+    let total = Instant::now();
+    let sig_strings: Vec<String> = signatures.iter().map(|s| s.to_string()).collect();
+    let rpc_started = Instant::now();
+    let encoded: String = rpc.send(
+        RpcRequest::Custom {
+            method: "getTransactionFixtures",
+        },
+        json!([sig_strings]),
+    )?;
+    let rpc_elapsed = rpc_started.elapsed();
+    let decode_started = Instant::now();
+    let bytes = BASE64_STANDARD.decode(&encoded).map_err(|e| {
+        ClientError::from(ClientErrorKind::Custom(format!(
+            "getTransactionFixtures: server returned non-base64 payload: {e}"
+        )))
+    })?;
+    let batch = TransactionFixturesBatch::deserialize(&bytes).map_err(|e| {
+        ClientError::from(ClientErrorKind::Custom(format!(
+            "getTransactionFixtures: failed to decode batch bytes: {e}"
+        )))
+    })?;
+    let decode_elapsed = decode_started.elapsed();
+    println!(
+        "fixture batch fetch: {:.3}s total (rpc {:.3}s, decode {:.3}s; {} signatures, {} unique \
+         blobs, {} B wire)",
+        total.elapsed().as_secs_f64(),
+        rpc_elapsed.as_secs_f64(),
+        decode_elapsed.as_secs_f64(),
+        signatures.len(),
+        batch.blobs.len(),
+        encoded.len(),
+    );
+    Ok(batch)
 }
 
 fn main() {
@@ -324,16 +380,126 @@ fn apply_program_replacements(
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let (signature, rpc_url, replace_programs) = match parse_args(&args) {
+    if args.get(1).map(String::as_str) == Some("block") {
+        return run_block(&args);
+    }
+    run_replay(&args)
+}
+
+fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.len() < 4 {
+        eprintln!(
+            "usage: {} block <slot> <solana_rpc_url> [penrose_rpc_url]\n\n  slot             block \
+             slot to load via getBlock\n  solana_rpc_url   JSON-RPC for getBlock (validator)\n  \
+             penrose_rpc_url  JSON-RPC for getTransactionFixtures (penrose-server); defaults to \
+             $PENROSE_RPC or solana_rpc_url",
+            args.first().map(String::as_str).unwrap_or("delorean"),
+        );
+        process::exit(2);
+    }
+    let slot: u64 = args[2]
+        .parse()
+        .map_err(|e| format!("bad slot `{}`: {e}", args[2]))?;
+    let solana_rpc_url = args[3].clone();
+    let penrose_rpc_url = args
+        .get(4)
+        .cloned()
+        .or_else(|| env::var("PENROSE_RPC").ok())
+        .unwrap_or_else(|| solana_rpc_url.clone());
+
+    println!("connecting to {solana_rpc_url} for getBlock");
+    let solana_rpc = RpcClient::new(solana_rpc_url);
+    let block = solana_rpc.get_block_with_config(
+        slot,
+        RpcBlockConfig {
+            encoding: Some(UiTransactionEncoding::Base64),
+            transaction_details: Some(TransactionDetails::Full),
+            rewards: Some(false),
+            commitment: Some(CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+            ..RpcBlockConfig::default()
+        },
+    )?;
+
+    let mut signatures: Vec<Signature> = Vec::new();
+    let mut total_txs = 0u32;
+    let mut vote_txs = 0u32;
+    if let Some(txs) = block.transactions {
+        for tx in txs {
+            total_txs += 1;
+            let encoded = &tx.transaction;
+            let Some(versioned) = encoded.decode() else {
+                continue;
+            };
+            if is_simple_vote_transaction(&versioned) {
+                vote_txs += 1;
+                continue;
+            }
+            let Some(sig) = versioned.signatures.first() else {
+                continue;
+            };
+            signatures.push(*sig);
+        }
+    }
+
+    println!(
+        "block {slot}: {total_txs} transactions, {vote_txs} votes skipped, {} non-vote signatures",
+        signatures.len()
+    );
+
+    if signatures.is_empty() {
+        println!("no non-vote transactions to fetch");
+        return Ok(());
+    }
+
+    println!("connecting to {penrose_rpc_url} for getTransactionFixtures");
+    let penrose_rpc = RpcClient::new(penrose_rpc_url);
+    let batch = get_transaction_fixtures_batch(&penrose_rpc, &signatures)?;
+    if batch.fixtures.len() != signatures.len() {
+        return Err(format!(
+            "getTransactionFixtures returned {} fixtures for {} signatures",
+            batch.fixtures.len(),
+            signatures.len()
+        )
+        .into());
+    }
+
+    let mut present = 0u32;
+    let mut replayed = 0u32;
+    for (signature, entry) in signatures.iter().zip(batch.fixtures.iter()) {
+        let Some(batch_fixture) = entry else {
+            println!("{signature}: no penrose fixture");
+            continue;
+        };
+        present += 1;
+        let fixture = batch_fixture.clone().into_inlined(&batch.blobs);
+        println!("\n========== {signature} ==========");
+        print_fixture_summary(&fixture);
+        replay_fixture(&fixture, &[])?;
+        replayed += 1;
+    }
+
+    println!(
+        "\nblock {slot} done: {} non-vote txs, {present} fixtures present, {replayed} replayed",
+        signatures.len()
+    );
+    Ok(())
+}
+
+fn run_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (signature, rpc_url, replace_programs) = match parse_args(args) {
         Ok(v) => v,
         Err(msg) => {
             eprintln!(
-                "usage: {} [--replace-program=<PUBKEY>:<PATH> | --replace-program <PUBKEY>:<PATH> ...] \
-                     <signature_base58> [rpc_url]\n\npositional:\nsignature_base58  the tx signature \
-                     to replay\nrpc_url           optional; defaults to \
-                     {DEFAULT_RPC_URL}\n\noptions:\n--replace-program=… / --replace-program …  replace \
-                     deployed ELF (loader-v1/v2 inline; v3 = patch programdata; v4 = patch \
-                     tail)\n\nerror: {msg}",
+                "usage: {} [replay] [--replace-program=<PUBKEY>:<PATH> | --replace-program \
+                     <PUBKEY>:<PATH> ...] <signature_base58> [rpc_url]\n       {} block <slot> \
+                     <solana_rpc_url> [penrose_rpc_url]\n\nreplay:\n  signature_base58  tx to \
+                     replay\n  rpc_url           penrose-server JSON-RPC; defaults to \
+                     {DEFAULT_RPC_URL}\n\nblock:\n  fetches getBlock, skips votes, batch-fetches \
+                     fixtures via getTransactionFixtures, replays each present fixture\n\noptions:\n\
+                     --replace-program  replace deployed ELF before replay (replay mode only)\n\n\
+                     error: {msg}",
+                args.first().map(String::as_str).unwrap_or("delorean"),
                 args.first().map(String::as_str).unwrap_or("delorean"),
             );
             process::exit(2);
@@ -349,11 +515,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     print_fixture_summary(&fixture);
+    replay_fixture(&fixture, &replace_programs)?;
+    Ok(())
+}
 
+fn replay_fixture(
+    fixture: &TransactionFixture,
+    replace_programs: &[ProgramReplacement],
+) -> Result<(), Box<dyn std::error::Error>> {
     println!("\nbuilding SVM environment...");
     let rent = extract_rent(&fixture.sysvars);
-    let bank = build_mock_bank(&fixture);
-    apply_program_replacements(&bank, &rent, &replace_programs)?;
+    let bank = build_mock_bank(fixture);
+    apply_program_replacements(&bank, &rent, replace_programs)?;
     let (agave_feature_set, feature_set) = feature_sets_from_fixture(&fixture.enabled_features);
     let svm_budget =
         SVMTransactionExecutionBudget::new_with_defaults(feature_set.raise_cpi_nesting_limit_to_8);
@@ -373,8 +546,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Some(loader_v1),
         Some(loader_v2),
     );
-    // Match Bank::apply_simd_0339_invoke_cost_changes — InvokeContext must use the same
-    // `invoke_units` (SIMD-0339) and stack depth budget (SIMD-0268) as a real bank.
     let simd_0268_active =
         agave_feature_set.is_active(&agave_feature_set::raise_cpi_nesting_limit_to_8::id());
     let simd_0339_active =
@@ -400,7 +571,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &reserved,
     )?;
 
-    let fee_details = replay_fee_details(&fixture, &sanitized, &agave_feature_set);
+    let fee_details = replay_fee_details(fixture, &sanitized, &agave_feature_set);
 
     println!("executing...\n");
     let env = TransactionProcessingEnvironment {
@@ -438,7 +609,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &cfg,
     );
 
-    print_outcome(&fixture, &sanitized, &out.processing_results);
+    print_outcome(fixture, &sanitized, &out.processing_results);
     Ok(())
 }
 

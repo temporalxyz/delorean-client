@@ -4,7 +4,7 @@ use {
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     std::sync::Arc,
-    wincode::{SchemaRead, SchemaWrite, containers::Vec as WincodeVec, len::BincodeLen},
+    wincode::{SchemaRead, containers::Vec as WincodeVec, len::BincodeLen},
 };
 
 pub(crate) type DefaultFixtureConfig =
@@ -17,7 +17,7 @@ fn wincode_config() -> DefaultFixtureConfig {
 
 pub(crate) const FIXTURE_ACCOUNT_FLAG_EXECUTABLE: u8 = 1 << 0;
 
-#[derive(SchemaWrite, SchemaRead)]
+#[derive(SchemaRead)]
 pub struct TransactionFixture {
     pub schema_version: u32,
 
@@ -55,7 +55,7 @@ pub struct TransactionFixture {
     pub post_accounts: Vec<FixtureAccount>,
 }
 
-#[derive(SchemaWrite, SchemaRead)]
+#[derive(SchemaRead)]
 pub struct FixtureAccount {
     pub pubkey: Pubkey,
     pub owner: Pubkey,
@@ -71,13 +71,13 @@ impl FixtureAccount {
     }
 }
 
-#[derive(SchemaWrite, SchemaRead)]
+#[derive(SchemaRead)]
 pub struct FixtureProgramData {
     pub program_id: Pubkey,
     pub programdata: FixtureBlob,
 }
 
-#[derive(SchemaWrite, SchemaRead)]
+#[derive(Clone, Debug, SchemaRead)]
 pub struct FixtureSysvar {
     pub sysvar_id: Pubkey,
     #[wincode(with = "WincodeVec<u8, BincodeLen>")]

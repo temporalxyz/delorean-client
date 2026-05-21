@@ -1,9 +1,9 @@
 use {
     solana_pubkey::Pubkey,
-    wincode::{SchemaRead, SchemaWrite, containers::Vec as WincodeVec, len::BincodeLen},
+    wincode::{SchemaRead, containers::Vec as WincodeVec, len::BincodeLen},
 };
 
-#[derive(SchemaWrite, SchemaRead)]
+#[derive(Clone, Debug, SchemaRead)]
 pub struct ExecutionResult {
     #[wincode(with = "WincodeVec<u8, BincodeLen>")]
     pub status: Vec<u8>,
