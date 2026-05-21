@@ -985,8 +985,11 @@ fn execute_fixture(
         },
         ..Default::default()
     };
+    // Nonce txs must pass the durable-nonce account here so the loader captures
+    // post-advance nonce state in RollbackAccounts for executed-failed txs.
+    let nonce_address = sanitized.get_durable_nonce().copied();
     let check = vec![Ok(CheckedTransactionDetails::new(
-        None,
+        nonce_address,
         SVMTransactionExecutionAndFeeBudgetLimits {
             budget: svm_budget,
             loaded_accounts_data_size_limit: MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
