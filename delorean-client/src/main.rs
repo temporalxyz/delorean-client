@@ -2,6 +2,9 @@ use {
     agave_feature_set::FeatureSet,
     agave_penrose_types::{FixtureAccount, FixtureProgramData, FixtureSysvar, TransactionFixture},
     agave_reserved_account_keys::ReservedAccountKeys,
+    agave_syscalls::{
+        create_program_runtime_environment_v1, create_program_runtime_environment_v2,
+    },
     ahash::{AHashMap, AHashSet},
     base64::prelude::*,
     serde_json::json,
@@ -15,8 +18,8 @@ use {
     solana_message::{SimpleAddressLoader, v0::LoadedAddresses},
     solana_program_runtime::{
         execution_budget::{
-            SVMTransactionExecutionAndFeeBudgetLimits, SVMTransactionExecutionBudget,
-            MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
+            MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES, SVMTransactionExecutionAndFeeBudgetLimits,
+            SVMTransactionExecutionBudget,
         },
         invoke_context::BuiltinFunctionWithContext,
         loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
@@ -46,7 +49,6 @@ use {
     solana_svm_callback::{AccountState, InvokeContextCallback, TransactionProcessingCallback},
     solana_svm_feature_set::SVMFeatureSet,
     solana_svm_transaction::svm_message::SVMStaticMessage,
-    agave_syscalls::{create_program_runtime_environment_v1, create_program_runtime_environment_v2},
     solana_transaction::{sanitized::SanitizedTransaction, versioned::VersionedTransaction},
     solana_transaction_context::transaction::TransactionReturnData,
     std::{
@@ -56,8 +58,11 @@ use {
         path::{Path, PathBuf},
         process,
         sync::{Arc, RwLock},
+        time::Instant,
     },
 };
+
+mod synthetic_accounts;
 
 const DEFAULT_RPC_URL: &str = "http://localhost:8899";
 
@@ -65,15 +70,23 @@ fn get_transaction_fixture(
     rpc: &RpcClient,
     signature: &Signature,
 ) -> Result<Option<TransactionFixture>, ClientError> {
+    let total = Instant::now();
+    let rpc_started = Instant::now();
     let encoded: Option<String> = rpc.send(
         RpcRequest::Custom {
             method: "getTransactionFixture",
         },
         json!([signature.to_string()]),
     )?;
+    let rpc_elapsed = rpc_started.elapsed();
     let Some(b64) = encoded else {
+        println!(
+            "fixture fetch: {:.3}s (rpc only, no fixture stored)",
+            rpc_elapsed.as_secs_f64()
+        );
         return Ok(None);
     };
+    let decode_started = Instant::now();
     let bytes = BASE64_STANDARD.decode(&b64).map_err(|e| {
         ClientError::from(ClientErrorKind::Custom(format!(
             "getTransactionFixture: server returned non-base64 payload: {e}"
@@ -84,6 +97,15 @@ fn get_transaction_fixture(
             "getTransactionFixture: failed to decode fixture bytes: {e}"
         )))
     })?;
+    let decode_elapsed = decode_started.elapsed();
+    println!(
+        "fixture fetch: {:.3}s total (rpc {:.3}s, decode {:.3}s; {} B base64, {} B fixture)",
+        total.elapsed().as_secs_f64(),
+        rpc_elapsed.as_secs_f64(),
+        decode_elapsed.as_secs_f64(),
+        b64.len(),
+        bytes.len(),
+    );
     Ok(Some(fixture))
 }
 
@@ -100,10 +122,13 @@ struct ProgramReplacement {
     elf_path: PathBuf,
 }
 
-fn parse_one_program_replacement(spec: &str, flag_span: &str) -> Result<ProgramReplacement, String> {
-    let (key, path) = spec.split_once(':').ok_or_else(|| {
-        format!("--replace-program: expected <PUBKEY>:<PATH>, got `{flag_span}`")
-    })?;
+fn parse_one_program_replacement(
+    spec: &str,
+    flag_span: &str,
+) -> Result<ProgramReplacement, String> {
+    let (key, path) = spec
+        .split_once(':')
+        .ok_or_else(|| format!("--replace-program: expected <PUBKEY>:<PATH>, got `{flag_span}`"))?;
     let program_id: Pubkey = key
         .parse()
         .map_err(|e| format!("--replace-program: bad pubkey `{key}`: {e}"))?;
@@ -124,9 +149,9 @@ fn parse_args(args: &[String]) -> Result<(Signature, String, Vec<ProgramReplacem
             replace_programs.push(parse_one_program_replacement(rest, arg)?);
             i += 1;
         } else if arg == "--replace-program" {
-            let next = args.get(i + 1).ok_or_else(|| {
-                "--replace-program: missing value <PUBKEY>:<PATH>".to_string()
-            })?;
+            let next = args
+                .get(i + 1)
+                .ok_or_else(|| "--replace-program: missing value <PUBKEY>:<PATH>".to_string())?;
             replace_programs.push(parse_one_program_replacement(next, next)?);
             i += 2;
         } else {
@@ -413,7 +438,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &cfg,
     );
 
-    print_outcome(&fixture, &out.processing_results);
+    print_outcome(&fixture, &sanitized, &out.processing_results);
     Ok(())
 }
 
@@ -438,6 +463,7 @@ fn print_fixture_summary(f: &TransactionFixture) {
 
 fn print_outcome(
     fix: &TransactionFixture,
+    message: &SanitizedTransaction,
     results: &[solana_svm::transaction_processing_result::TransactionProcessingResult],
 ) {
     let result = results
@@ -473,7 +499,7 @@ fn print_outcome(
                 "  CUs             ",
                 actual_cus == fix.result.compute_units_consumed,
             );
-            let post_mismatches = post_account_mismatches(fix, exec);
+            let (post_mismatches, synthetic_checked) = post_account_mismatches(fix, exec, message);
             print_match("  post-state      ", post_mismatches.is_empty());
 
             println!("\n  log messages ({}):", logs.len());
@@ -482,7 +508,7 @@ fn print_outcome(
             }
 
             print_return_data_diff(fix, exec);
-            print_post_account_detail(fix, &post_mismatches);
+            print_post_account_detail(fix, &post_mismatches, synthetic_checked);
         }
         Ok(ProcessedTransaction::FeesOnly(fee_only)) => {
             println!("  fees-only (load failed): {:?}", fee_only.load_error);
@@ -597,21 +623,71 @@ fn post_account_shared_matches(
     Ok(())
 }
 
-fn post_account_mismatches(fix: &TransactionFixture, exec: &ExecutedTransaction) -> Vec<String> {
-    if fix.post_accounts.is_empty() {
-        return Vec::new();
+/// Post-state the bank commits after execution.
+///
+/// Successful txs: all writable changes in `loaded_transaction.accounts`.
+/// Failed txs: writable changes roll back to pre-state; only the fee payer
+/// (and nonce account when present) stay post-fee / post-nonce-advance via
+/// [`RollbackAccounts`], matching penrose's `bank.get_account` post snapshot.
+fn committed_post_accounts_for_failed_tx(
+    fix: &TransactionFixture,
+    rollback: &solana_svm::rollback_accounts::RollbackAccounts,
+) -> HashMap<Pubkey, AccountSharedData> {
+    let mut map: HashMap<Pubkey, AccountSharedData> = fix
+        .pre_accounts
+        .iter()
+        .map(|fa| (fa.pubkey, fixture_account_to_shared(fa)))
+        .collect();
+    for (pubkey, account) in rollback {
+        map.insert(*pubkey, account.clone());
     }
-    let map: HashMap<Pubkey, &AccountSharedData> = exec
+    map
+}
+
+fn post_account_mismatches(
+    fix: &TransactionFixture,
+    exec: &ExecutedTransaction,
+    message: &SanitizedTransaction,
+) -> (Vec<String>, usize) {
+    if fix.post_accounts.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let loaded: HashMap<Pubkey, &AccountSharedData> = exec
         .loaded_transaction
         .accounts
         .iter()
         .map(|(k, v)| (*k, v))
         .collect();
+    let failed_committed = exec.execution_details.status.is_err().then(|| {
+        committed_post_accounts_for_failed_tx(fix, &exec.loaded_transaction.rollback_accounts)
+    });
     let mut mismatches = Vec::new();
+    let mut synthetic_checked = 0usize;
     for fa in &fix.post_accounts {
-        match map.get(&fa.pubkey) {
+        if let Some(kind) = synthetic_accounts::classify(&fa.pubkey) {
+            synthetic_checked += 1;
+            match loaded.get(&fa.pubkey) {
+                None => mismatches.push(format!(
+                    "{}: pubkey not in loaded transaction account list after execution",
+                    fa.pubkey
+                )),
+                Some(act) => {
+                    if let Err(e) = synthetic_accounts::validate_post_account(kind, act, message) {
+                        mismatches.push(e);
+                    }
+                }
+            }
+            continue;
+        }
+
+        let act = if let Some(ref committed) = failed_committed {
+            committed.get(&fa.pubkey)
+        } else {
+            loaded.get(&fa.pubkey).copied()
+        };
+        match act {
             None => mismatches.push(format!(
-                "{}: pubkey not in loaded transaction account list after execution",
+                "{}: pubkey not in replay committed post-state",
                 fa.pubkey
             )),
             Some(act) => {
@@ -621,21 +697,33 @@ fn post_account_mismatches(fix: &TransactionFixture, exec: &ExecutedTransaction)
             }
         }
     }
-    mismatches
+    (mismatches, synthetic_checked)
 }
 
-fn print_post_account_detail(fix: &TransactionFixture, mismatches: &[String]) {
-    println!("\n--- post-account state (fixture vs replay loaded accounts) ---");
+fn print_post_account_detail(
+    fix: &TransactionFixture,
+    mismatches: &[String],
+    synthetic_checked: usize,
+) {
+    println!("\n--- post-account state (fixture vs replay committed post-state) ---");
     if fix.post_accounts.is_empty() {
         println!("  (no post_accounts in fixture)");
         return;
     }
 
     if mismatches.is_empty() {
-        println!(
-            "  all {} fixture post_account entries: MATCH replay state",
-            fix.post_accounts.len()
-        );
+        if synthetic_checked > 0 {
+            println!(
+                "  all {} fixture post_account entries ({} synthetic): MATCH replay state",
+                fix.post_accounts.len(),
+                synthetic_checked,
+            );
+        } else {
+            println!(
+                "  all {} fixture post_account entries: MATCH replay state",
+                fix.post_accounts.len()
+            );
+        }
     } else {
         for m in mismatches {
             println!("  MISMATCH: {m}");

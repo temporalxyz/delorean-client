@@ -28,6 +28,8 @@ solana-compute-budget = { workspace = true }
 solana-compute-budget-instruction = { workspace = true }
 solana-compute-budget-program = { workspace = true }
 solana-fee-structure = { workspace = true }
+solana-instruction = "3.1.0"
+solana-instructions-sysvar = "3.0.0"
 solana-loader-v3-interface = { workspace = true }
 solana-loader-v4-interface = { workspace = true }
 solana-message = { workspace = true }

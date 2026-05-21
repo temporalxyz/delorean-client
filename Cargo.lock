@@ -1377,6 +1377,8 @@ dependencies = [
  "solana-compute-budget-instruction",
  "solana-compute-budget-program",
  "solana-fee-structure",
+ "solana-instruction",
+ "solana-instructions-sysvar",
  "solana-loader-v3-interface",
  "solana-loader-v4-interface",
  "solana-message",
