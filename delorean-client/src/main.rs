@@ -15,17 +15,17 @@ use {
     serde_json::json,
     solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
     solana_bpf_loader_program as _,
-    solana_compute_budget::compute_budget::ComputeBudget,
+    solana_compute_budget::{
+        compute_budget::ComputeBudget,
+        compute_budget_limits::ComputeBudgetLimits,
+    },
     solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions,
     solana_fee_structure::FeeDetails,
     solana_loader_v3_interface::{get_program_data_address, state::UpgradeableLoaderState},
     solana_loader_v4_interface::state::LoaderV4State,
     solana_message::{SimpleAddressLoader, v0::LoadedAddresses},
     solana_program_runtime::{
-        execution_budget::{
-            MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES, SVMTransactionExecutionAndFeeBudgetLimits,
-            SVMTransactionExecutionBudget,
-        },
+        execution_budget::{SVMTransactionExecutionBudget},
         invoke_context::BuiltinFunctionWithContext,
         loaded_programs::{BlockRelation, ForkGraph, ProgramCacheEntry},
     },
@@ -983,7 +983,12 @@ fn execute_fixture(
         print_instructions_after_sanitization(&sanitized);
     }
 
-    let fee_details = replay_fee_details(fixture, &sanitized, &agave_feature_set);
+    let compute_budget_limits = process_compute_budget_instructions(
+        SVMStaticMessage::program_instructions_iter(&sanitized),
+        &agave_feature_set,
+    )
+    .unwrap_or_default();
+    let fee_details = replay_fee_details(fixture, &sanitized, &compute_budget_limits);
 
     let env = TransactionProcessingEnvironment {
         blockhash: fixture.recent_blockhash,
@@ -1006,13 +1011,14 @@ fn execute_fixture(
     // Nonce txs must pass the durable-nonce account here so the loader captures
     // post-advance nonce state in RollbackAccounts for executed-failed txs.
     let nonce_address = sanitized.get_durable_nonce().copied();
+    let compute_budget_and_limits = compute_budget_limits.get_compute_budget_and_limits(
+        compute_budget_limits.loaded_accounts_bytes,
+        fee_details,
+        simd_0268_active,
+    );
     let check = vec![Ok(CheckedTransactionDetails::new(
         nonce_address,
-        SVMTransactionExecutionAndFeeBudgetLimits {
-            budget: svm_budget,
-            loaded_accounts_data_size_limit: MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
-            fee_details,
-        },
+        compute_budget_and_limits,
     ))];
 
     let out = batch_processor.load_and_execute_sanitized_transactions(
@@ -1401,7 +1407,7 @@ fn feature_sets_from_fixture(active: &[Pubkey]) -> (FeatureSet, SVMFeatureSet) {
 fn replay_fee_details(
     fixture: &TransactionFixture,
     sanitized: &SanitizedTransaction,
-    agave_feature_set: &FeatureSet,
+    compute_budget_limits: &ComputeBudgetLimits,
 ) -> FeeDetails {
     let signature_count = sanitized
         .num_transaction_signatures()
@@ -1409,12 +1415,7 @@ fn replay_fee_details(
         .saturating_add(sanitized.num_secp256k1_signatures())
         .saturating_add(sanitized.num_secp256r1_signatures());
     let sig_fee = signature_count.saturating_mul(fixture.lamports_per_signature);
-    let prioritization_fee = process_compute_budget_instructions(
-        SVMStaticMessage::program_instructions_iter(sanitized),
-        agave_feature_set,
-    )
-    .unwrap_or_default()
-    .get_prioritization_fee();
+    let prioritization_fee = compute_budget_limits.get_prioritization_fee();
     FeeDetails::new(sig_fee, prioritization_fee)
 }
 
