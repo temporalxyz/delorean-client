@@ -34,7 +34,7 @@ use {
     solana_rent::Rent,
     solana_sdk_ids::{
         bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable, compute_budget, loader_v4,
-        native_loader, vote,
+        native_loader,
     },
     solana_signature::Signature,
     solana_svm::{
@@ -73,6 +73,20 @@ const PENROSE_RPC_TIMEOUT: Duration = Duration::from_secs(300);
 
 type RpcError = Box<dyn std::error::Error>;
 
+/// Where time went inside `JsonRpcClient::call`.
+///
+/// `waiting_response_secs` is dominated by **blocked in `send()`** (request + waiting until an HTTP
+/// `Response` is available). For buffered RPC handlers that is usually most of wall time—the
+/// server building the gzip body before any bytes are returned—and not the labeled read/gzip/json
+/// micro-phases afterward.
+#[derive(Clone, Copy, Debug, Default)]
+struct RpcCallTiming {
+    waiting_response_secs: f64,
+    read_wire_secs: f64,
+    decompress_secs: f64,
+    json_parse_secs: f64,
+}
+
 struct RpcTransfer {
     wire_bytes: usize,
     json_bytes: usize,
@@ -104,6 +118,7 @@ impl RpcTransfer {
 struct RpcCall<T> {
     value: T,
     transfer: RpcTransfer,
+    timing: RpcCallTiming,
 }
 
 struct JsonRpcClient {
@@ -135,19 +150,26 @@ impl JsonRpcClient {
             "method": method,
             "params": params,
         });
+        let waiting_response_start = Instant::now();
         let response = self
             .client
             .post(&self.url)
             .header(reqwest::header::ACCEPT_ENCODING, "gzip")
             .json(&body)
             .send()?;
+        let waiting_response_secs = waiting_response_start.elapsed().as_secs_f64();
         let gzip = response
             .headers()
             .get(reqwest::header::CONTENT_ENCODING)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.eq_ignore_ascii_case("gzip"));
+
+        let read_start = Instant::now();
         let wire_bytes = response.bytes()?.to_vec();
         let wire_len = wire_bytes.len();
+        let read_wire_secs = read_start.elapsed().as_secs_f64();
+
+        let decompress_start = Instant::now();
         let json_bytes = if gzip {
             let mut decoder = GzDecoder::new(wire_bytes.as_slice());
             let mut decompressed = Vec::new();
@@ -157,182 +179,121 @@ impl JsonRpcClient {
             wire_bytes
         };
         let json_len = json_bytes.len();
+        let decompress_secs = decompress_start.elapsed().as_secs_f64();
+
+        let parse_start = Instant::now();
         let resp: serde_json::Value = serde_json::from_slice(&json_bytes)?;
-        if let Some(err) = resp.get("error") {
-            return Err(format!("json-rpc {method} error: {err}").into());
+        let json_parse_secs = parse_start.elapsed().as_secs_f64();
+
+        let serde_json::Value::Object(mut map) = resp else {
+            return Err(format!("json-rpc {method}: expected JSON object envelope").into());
+        };
+        if let Some(err) = map.remove("error") {
+            if !err.is_null() {
+                return Err(format!("json-rpc {method} error: {err}").into());
+            }
         }
+
+        // Do not `clone()` `result`: batch responses are a single giant base64 string; cloning
+        // would duplicate ~hundreds of MB of memcpy after serde already built the owned String.
+        let result = map
+            .remove("result")
+            .ok_or_else(|| format!("json-rpc {method}: missing \"result\""))?;
+
         Ok(RpcCall {
-            value: resp["result"].clone(),
+            value: result,
             transfer: RpcTransfer {
                 wire_bytes: wire_len,
                 json_bytes: json_len,
+            },
+            timing: RpcCallTiming {
+                waiting_response_secs,
+                read_wire_secs,
+                decompress_secs,
+                json_parse_secs,
             },
         })
     }
 }
 
-fn block_transaction_base64(tx: &serde_json::Value) -> Option<&str> {
-    let field = tx.get("transaction")?;
-    if let Some(arr) = field.as_array() {
-        arr.first()?.as_str()
-    } else {
-        field.as_str()
-    }
-}
-
-fn fetch_non_vote_signatures_from_block(
-    rpc_url: &str,
-    slot: u64,
-) -> Result<(Vec<Signature>, u32, u32), RpcError> {
-    let rpc = JsonRpcClient::new(rpc_url);
-    let RpcCall {
-        value: result,
-        transfer: _,
-    } = rpc.call(
-        "getBlock",
-        json!([
-            slot,
-            {
-                "encoding": "base64",
-                "transactionDetails": "full",
-                "rewards": false,
-                "maxSupportedTransactionVersion": 0,
-                "commitment": "confirmed",
-            }
-        ]),
-    )?;
-    if result.is_null() {
-        return Err(format!("getBlock: slot {slot} not available (null result)").into());
-    }
-    let txs = result
-        .get("transactions")
-        .and_then(|v| v.as_array())
-        .ok_or("getBlock: missing transactions array")?;
-    let mut signatures = Vec::new();
-    let mut total_txs = 0u32;
-    let mut vote_txs = 0u32;
-    for tx in txs {
-        total_txs += 1;
-        let Some(b64) = block_transaction_base64(tx) else {
-            continue;
-        };
-        let bytes = BASE64_STANDARD.decode(b64)?;
-        let versioned: VersionedTransaction = bincode::deserialize(&bytes)?;
-        if is_simple_vote_transaction(&versioned) {
-            vote_txs += 1;
-            continue;
-        }
-        if let Some(sig) = versioned.signatures.first() {
-            signatures.push(*sig);
-        }
-    }
-    Ok((signatures, total_txs, vote_txs))
-}
-
-/// Penrose captures non-vote transactions only; mirror the usual simple-vote check.
-fn is_simple_vote_transaction(tx: &VersionedTransaction) -> bool {
-    let keys = tx.message.static_account_keys();
-    !tx.message.instructions().is_empty()
-        && tx.message.instructions().iter().all(|ix| {
-            keys.get(ix.program_id_index as usize)
-                .map(|k| vote::check_id(k))
-                .unwrap_or(false)
-        })
-}
-
-fn get_transaction_fixture(
+fn get_slot_fixtures(
     rpc: &JsonRpcClient,
-    signature: &Signature,
-) -> Result<Option<TransactionFixture>, RpcError> {
+    slot: u64,
+) -> Result<Vec<(Signature, Option<TransactionFixture>)>, RpcError> {
     let total = Instant::now();
     let rpc_started = Instant::now();
     let RpcCall {
         value: result,
         transfer,
-    } = rpc.call(
-        "getTransactionFixture",
-        json!([signature.to_string()]),
-    )?;
+        timing,
+    } = rpc.call("getSlotsFixtures", json!([[slot]]))?;
     let rpc_elapsed = rpc_started.elapsed();
-    let Some(b64) = result.as_str() else {
-        println!(
-            "fixture fetch: {:.3}s (rpc only, no fixture stored){}",
-            rpc_elapsed.as_secs_f64(),
-            transfer.log_suffix()
-        );
-        return Ok(None);
-    };
+    let arr = result
+        .as_array()
+        .ok_or("getSlotsFixtures: expected array result")?;
+    let slot_obj = arr
+        .first()
+        .ok_or("getSlotsFixtures: empty result array")?;
+    let signatures = slot_obj
+        .get("signatures")
+        .and_then(|v| v.as_array())
+        .ok_or("getSlotsFixtures: missing signatures array")?;
+    let batch_b64 = slot_obj
+        .get("batch")
+        .and_then(|v| v.as_str())
+        .ok_or("getSlotsFixtures: missing batch field")?;
+    let batch_bytes = BASE64_STANDARD
+        .decode(batch_b64)
+        .map_err(|e| format!("getSlotsFixtures: non-base64 batch: {e}"))?;
+    let batch = TransactionFixturesBatch::deserialize(&batch_bytes)
+        .map_err(|e| format!("getSlotsFixtures: failed to decode batch: {e}"))?;
+    if batch.fixtures.len() != signatures.len() {
+        return Err(format!(
+            "getSlotsFixtures: batch/fixtures length mismatch ({} vs {})",
+            batch.fixtures.len(),
+            signatures.len(),
+        )
+        .into());
+    }
+    let mut out = Vec::with_capacity(signatures.len());
     let decode_started = Instant::now();
-    let bytes = BASE64_STANDARD
-        .decode(b64)
-        .map_err(|e| format!("getTransactionFixture: non-base64 payload: {e}"))?;
-    let fixture = TransactionFixture::deserialize(&bytes)
-        .map_err(|e| format!("getTransactionFixture: failed to decode fixture bytes: {e}"))?;
+    for (sig_value, fixture_opt) in signatures.iter().zip(batch.fixtures) {
+        let signature_str = sig_value
+            .as_str()
+            .ok_or("getSlotsFixtures: signature must be base58 string")?;
+        let signature: Signature = signature_str
+            .parse()
+            .map_err(|e| format!("getSlotsFixtures: bad signature `{signature_str}`: {e}"))?;
+        let fixture = fixture_opt.map(|f| f.into_inlined(&batch.blobs));
+        out.push((signature, fixture));
+    }
     let decode_elapsed = decode_started.elapsed();
     println!(
-        "fixture fetch: {:.3}s total (rpc {:.3}s, decode {:.3}s; {} B base64, {} B fixture{})",
+        "slot fixtures fetch: {:.3}s total (rpc {:.3}s = wait {:.3}s + read {:.3}s + gzip {:.3}s + json {:.3}s, decode {:.3}s); slot {slot}, {} entries{}",
         total.elapsed().as_secs_f64(),
         rpc_elapsed.as_secs_f64(),
+        timing.waiting_response_secs,
+        timing.read_wire_secs,
+        timing.decompress_secs,
+        timing.json_parse_secs,
         decode_elapsed.as_secs_f64(),
-        b64.len(),
-        bytes.len(),
+        out.len(),
         transfer.log_suffix()
     );
-    Ok(Some(fixture))
+    Ok(out)
 }
 
-fn get_transaction_fixtures_batch(
-    rpc: &JsonRpcClient,
-    signatures: &[Signature],
-    log_timing: bool,
-) -> Result<TransactionFixturesBatch, RpcError> {
-    let total = Instant::now();
-    let sig_strings: Vec<String> = signatures.iter().map(|s| s.to_string()).collect();
-    let rpc_started = Instant::now();
-    let RpcCall {
-        value: result,
-        transfer,
-    } = rpc.call("getTransactionFixtures", json!([sig_strings]))?;
-    let encoded = result
-        .as_str()
-        .ok_or("getTransactionFixtures: expected base64 string result")?;
-    let rpc_elapsed = rpc_started.elapsed();
-    let decode_started = Instant::now();
+fn decode_fixture_b64(b64: &str, label: &str) -> Result<TransactionFixture, RpcError> {
     let bytes = BASE64_STANDARD
-        .decode(encoded)
-        .map_err(|e| format!("getTransactionFixtures: non-base64 payload: {e}"))?;
-    let batch = TransactionFixturesBatch::deserialize(&bytes)
-        .map_err(|e| format!("getTransactionFixtures: failed to decode batch bytes: {e}"))?;
-    let decode_elapsed = decode_started.elapsed();
-    let transfer_suffix = transfer.log_suffix();
-    if log_timing {
-        println!(
-            "fixture batch fetch: {:.3}s total (rpc {:.3}s, decode {:.3}s; {} signatures, {} \
-             unique blobs, {} B base64{})",
-            total.elapsed().as_secs_f64(),
-            rpc_elapsed.as_secs_f64(),
-            decode_elapsed.as_secs_f64(),
-            signatures.len(),
-            batch.blobs.len(),
-            encoded.len(),
-            transfer_suffix
-        );
-    } else {
-        println!(
-            "fixture batch fetch: {} signatures, {} unique blobs, {} B base64{}",
-            signatures.len(),
-            batch.blobs.len(),
-            encoded.len(),
-            transfer_suffix
-        );
-    }
-    Ok(batch)
+        .decode(b64)
+        .map_err(|e| format!("{label}: non-base64 payload: {e}"))?;
+    TransactionFixture::deserialize(&bytes)
+        .map_err(|e| format!("{label}: failed to decode fixture bytes: {e}").into())
 }
 
 struct BlockArgs {
     verbose: bool,
     slot: u64,
-    solana_rpc_url: String,
     penrose_rpc_url: String,
 }
 
@@ -345,24 +306,68 @@ fn parse_block_args(args: &[String]) -> Result<BlockArgs, String> {
             other => positional.push(other.to_string()),
         }
     }
-    if positional.len() < 2 {
-        return Err("expected <slot> and <solana_rpc_url>".into());
+    if positional.is_empty() {
+        return Err("expected <slot>".into());
     }
     let slot: u64 = positional[0]
         .parse()
         .map_err(|e| format!("bad slot `{}`: {e}", positional[0]))?;
-    let solana_rpc_url = positional[1].clone();
     let penrose_rpc_url = positional
-        .get(2)
+        .get(1)
         .cloned()
         .or_else(|| env::var("PENROSE_RPC").ok())
-        .unwrap_or_else(|| solana_rpc_url.clone());
+        .unwrap_or_else(|| DEFAULT_RPC_URL.into());
     Ok(BlockArgs {
         verbose,
         slot,
-        solana_rpc_url,
         penrose_rpc_url,
     })
+}
+
+fn get_transaction_fixture(
+    rpc: &JsonRpcClient,
+    signature: &Signature,
+) -> Result<Option<TransactionFixture>, RpcError> {
+    let total = Instant::now();
+    let rpc_started = Instant::now();
+    let RpcCall {
+        value: result,
+        transfer,
+        timing,
+    } = rpc.call(
+        "getTransactionFixture",
+        json!([signature.to_string()]),
+    )?;
+    let rpc_elapsed = rpc_started.elapsed();
+    let Some(b64) = result.as_str() else {
+        println!(
+            "fixture fetch: {:.3}s (rpc only, no fixture stored; wait {:.3}s read {:.3}s gzip {:.3}s json {:.3}s){}",
+            rpc_elapsed.as_secs_f64(),
+            timing.waiting_response_secs,
+            timing.read_wire_secs,
+            timing.decompress_secs,
+            timing.json_parse_secs,
+            transfer.log_suffix()
+        );
+        return Ok(None);
+    };
+    let decode_started = Instant::now();
+    let fixture = decode_fixture_b64(b64, "getTransactionFixture")?;
+    let decode_elapsed = decode_started.elapsed();
+    println!(
+        "fixture fetch: {:.3}s total (rpc {:.3}s = wait {:.3}s + read {:.3}s + gzip {:.3}s + json {:.3}s, decode {:.3}s; {} B base64, {} B fixture{})",
+        total.elapsed().as_secs_f64(),
+        rpc_elapsed.as_secs_f64(),
+        timing.waiting_response_secs,
+        timing.read_wire_secs,
+        timing.decompress_secs,
+        timing.json_parse_secs,
+        decode_elapsed.as_secs_f64(),
+        b64.len(),
+        fixture.transaction.len(),
+        transfer.log_suffix()
+    );
+    Ok(Some(fixture))
 }
 
 struct ReplayCompare {
@@ -719,11 +724,10 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         Ok(v) => v,
         Err(msg) => {
             eprintln!(
-                "usage: {} block [-v] <slot> <solana_rpc_url> [penrose_rpc_url]\n\n  -v  verbose \
-                 replay (fixture summary, logs, account diffs)\n\n  slot             block slot to \
-                 load via getBlock\n  solana_rpc_url   JSON-RPC for getBlock (validator)\n  \
-                 penrose_rpc_url  JSON-RPC for getTransactionFixtures (penrose-server); defaults \
-                 to $PENROSE_RPC or solana_rpc_url\n\nerror: {msg}",
+                "usage: {} block [-v] <slot> [penrose_rpc_url]\n\n  -v  verbose replay \
+                 (fixture summary, logs, account diffs)\n\n  slot             block slot to \
+                 load from penrose\n  penrose_rpc_url  JSON-RPC for getSlotsFixtures \
+                 (penrose-server); defaults to $PENROSE_RPC or {DEFAULT_RPC_URL}\n\nerror: {msg}",
                 args.first().map(String::as_str).unwrap_or("delorean"),
             );
             process::exit(2);
@@ -732,37 +736,19 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let BlockArgs {
         verbose,
         slot,
-        solana_rpc_url,
         penrose_rpc_url,
     } = block_args;
 
     if verbose {
-        println!("connecting to {solana_rpc_url} for getBlock");
-    }
-    let (signatures, total_txs, vote_txs) =
-        fetch_non_vote_signatures_from_block(&solana_rpc_url, slot)?;
-
-    println!(
-        "block {slot}: {total_txs} transactions, {vote_txs} votes skipped, {} non-vote",
-        signatures.len()
-    );
-
-    if signatures.is_empty() {
-        return Ok(());
-    }
-
-    if verbose {
-        println!("connecting to {penrose_rpc_url} for getTransactionFixtures");
+        println!("connecting to {penrose_rpc_url} for getSlotsFixtures");
     }
     let penrose_rpc = JsonRpcClient::new(penrose_rpc_url);
-    let batch = get_transaction_fixtures_batch(&penrose_rpc, &signatures, verbose)?;
-    if batch.fixtures.len() != signatures.len() {
-        return Err(format!(
-            "getTransactionFixtures returned {} fixtures for {} signatures",
-            batch.fixtures.len(),
-            signatures.len()
-        )
-        .into());
+    let entries = get_slot_fixtures(&penrose_rpc, slot)?;
+
+    println!("slot {slot}: {} penrose fixture entries", entries.len());
+
+    if entries.is_empty() {
+        return Ok(());
     }
 
     let mut present = 0u32;
@@ -778,14 +764,14 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if !verbose {
         print_block_table_header();
     }
-    for (signature, entry) in signatures.iter().zip(batch.fixtures.iter()) {
-        let Some(batch_fixture) = entry else {
+    for (signature, fixture_opt) in entries {
+        let Some(fixture) = fixture_opt else {
             missing += 1;
             if verbose {
                 println!("{signature}: no penrose fixture");
             } else {
                 print_block_table_row(
-                    signature,
+                    &signature,
                     &ReplayCompare {
                         status_match: None,
                         cu_match: None,
@@ -797,7 +783,6 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
         present += 1;
-        let fixture = batch_fixture.clone().into_inlined(&batch.blobs);
         if verbose {
             println!("\n========== {signature} ==========");
             print_fixture_summary(&fixture);
@@ -814,12 +799,12 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if cmp.pass {
                     pass += 1;
                 }
-                print_block_table_row(signature, &cmp);
+                print_block_table_row(&signature, &cmp);
             }
             Err(_) => {
                 tally_match_field(Some(false), &mut status_ok, &mut status_total);
                 print_block_table_row(
-                    signature,
+                    &signature,
                     &ReplayCompare {
                         status_match: Some(false),
                         cu_match: None,
@@ -833,17 +818,15 @@ fn run_block(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     if verbose {
         println!(
-            "\nblock {slot} done: {} non-vote txs, {present} fixtures present, {replayed} replayed, {missing} missing",
-            signatures.len()
+            "\nslot {slot} done: {present} fixtures present, {replayed} replayed, {missing} missing",
         );
     } else {
         let mismatches = (status_total - status_ok) + (cu_total - cu_ok) + (state_total - state_ok);
         println!(
-            "block {slot} done: {} non-vote, {present} fixtures, \
+            "slot {slot} done: {present} fixtures, \
              status {status_ok}/{status_total}, cu {cu_ok}/{cu_total}, \
              state {state_ok}/{state_total}, pass {pass}/{present}, \
              {mismatches} mismatches, {missing} missing",
-            signatures.len()
         );
     }
     Ok(())
@@ -856,14 +839,13 @@ fn run_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!(
                 "usage: {} [replay] [--replace-program=<PUBKEY>:<PATH> | --replace-program \
                      <PUBKEY>:<PATH> ...] <signature_base58> [rpc_url]\n       {} block [-v] <slot> \
-                     <solana_rpc_url> [penrose_rpc_url]\n\nreplay:\n  signature_base58  tx to \
-                     replay\n  rpc_url           penrose-server JSON-RPC; defaults to \
-                     {DEFAULT_RPC_URL}\n\nblock:\n  fetches getBlock, skips votes, batch-fetches \
-                     fixtures via getTransactionFixtures, replays each present fixture\n  default: \
-                     one line per tx (signature status cus state PASS|FAIL); -v for full output\n\n\
-                     options:\n  -v (block)        verbose block replay\n  --replace-program  replace \
-                     deployed ELF before replay (replay mode only)\n\n\
-                     error: {msg}",
+                     [penrose_rpc_url]\n\nreplay:\n  signature_base58  tx to replay\n  rpc_url \
+                     penrose-server JSON-RPC; defaults to {DEFAULT_RPC_URL}\n\nblock:\n  fetches \
+                     all fixtures penrose captured for the slot via getSlotsFixtures and replays \
+                     each present fixture\n  default: one line per tx (signature status cus state \
+                     PASS|FAIL); -v for full output\n\noptions:\n  -v (block)        verbose block \
+                     replay\n  --replace-program  replace deployed ELF before replay (replay mode \
+                     only)\n\nerror: {msg}",
                 args.first().map(String::as_str).unwrap_or("delorean"),
                 args.first().map(String::as_str).unwrap_or("delorean"),
             );
@@ -885,8 +867,25 @@ fn run_replay(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_instructions_after_sanitization(tx: &SanitizedTransaction) {
-    println!("\n--- instructions (after sanitization) ---");
+    println!("\n--- account keys (after sanitization) ---");
     let account_keys = tx.account_keys();
+    let static_len = tx.static_account_keys().len();
+    for (idx, key) in account_keys.iter().enumerate() {
+        let region = if idx < static_len {
+            "static"
+        } else if tx.is_writable(idx) {
+            "alt-w"
+        } else {
+            "alt-r"
+        };
+        println!(
+            "  [{idx:>2}] {key}  signer={} writable={} ({region})",
+            tx.is_signer(idx),
+            tx.is_writable(idx),
+        );
+    }
+
+    println!("\n--- instructions (after sanitization) ---");
     for (ix_index, (program_id, instruction)) in tx.program_instructions_iter().enumerate() {
         let data_hex: String = if instruction.data.is_empty() {
             "(empty)".to_string()
@@ -907,13 +906,13 @@ fn print_instructions_after_sanitization(tx: &SanitizedTransaction) {
         } else {
             println!("    {:<44} {:>6} {:>8}", "key", "signer", "writable");
         }
-        for account_index in instruction.accounts.iter() {
+        for (ix_acct_idx, account_index) in instruction.accounts.iter().enumerate() {
             let account_index = usize::from(*account_index);
             let key = account_keys
                 .get(account_index)
                 .expect("instruction account index in message account list");
             println!(
-                "    {:<44} {:>6} {:>8}",
+                "    ix_acct[{ix_acct_idx:>2}] msg[{account_index:>2}] {:<44} {:>6} {:>8}",
                 key,
                 tx.is_signer(account_index),
                 tx.is_writable(account_index),
